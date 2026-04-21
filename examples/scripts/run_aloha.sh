@@ -7,14 +7,14 @@ export MUJOCO_GL=egl
 export MUJOCO_EGL_DEVICE_ID=$device_id
 
 export OPENPI_DATA_HOME=./openpi
-export EXP=./logs/$proj_name; 
+export EXP=./logs/$proj_name;
 export CUDA_VISIBLE_DEVICES=$device_id
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
+export PYTHONPATH="${PYTHONPATH:-}:."
 
+uv pip install mujoco==2.3.7
 
-pip install mujoco==2.3.7
-
-python3 examples/launch_train_sim.py \
+uv run examples/launch_train_sim.py \
 --algorithm pixel_sac \
 --env aloha_cube \
 --prefix dsrl_pi0_aloha \

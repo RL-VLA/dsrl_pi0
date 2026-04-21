@@ -1,6 +1,8 @@
 [submodule "LIBERO"]
 	path = LIBERO
-	url = git@github.com:nakamotoo/LIBERO.git
+	url = git@github.com:RL-VLA/LIBERO.git
+	branch = run_fix_yipu
 [submodule "openpi"]
 	path = openpi
-	url = git@github.com:nakamotoo/openpi.git
+	url = git@github.com:RL-VLA/openpi.git
+	branch = run_fix_yipu

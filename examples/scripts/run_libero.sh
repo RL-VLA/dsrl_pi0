@@ -11,10 +11,11 @@ export OPENPI_DATA_HOME=./openpi
 export EXP=./logs/$proj_name; 
 export CUDA_VISIBLE_DEVICES=$device_id
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
+export PYTHONPATH="${PYTHONPATH:-}:."
 
-pip install mujoco==3.3.1
+uv pip install mujoco==3.3.1
 
-python3 examples/launch_train_sim.py \
+uv run examples/launch_train_sim.py \
 --algorithm pixel_sac \
 --env libero \
 --prefix dsrl_pi0_libero \

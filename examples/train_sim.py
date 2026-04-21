@@ -33,7 +33,7 @@ from openpi.policies import policy_config
 from openpi.shared import download
 
 home_dir = os.environ['HOME']
-compilation_cache.initialize_cache(os.path.join(home_dir, 'jax_compilation_cache'))
+compilation_cache.set_cache_dir(os.path.join(home_dir, 'jax_compilation_cache'))
 
 def _get_libero_env(task, resolution, seed):
     """Initializes and returns the LIBERO environment, along with the task description."""
@@ -49,12 +49,10 @@ def shard_batch(batch, sharding):
 
     Args:
         batch: A pytree of arrays.
-        sharding: A jax Sharding object with shape (num_devices,).
+        sharding: A jax NamedSharding partitioning the leading axis across devices.
     """
     return jax.tree_util.tree_map(
-        lambda x: jax.device_put(
-            x, sharding.reshape(sharding.shape[0], *((1,) * (x.ndim - 1)))
-        ),
+        lambda x: jax.device_put(x, sharding),
         batch,
     )
 
@@ -83,7 +81,8 @@ def main(variant):
     print('num devices', num_devices)
     print('batch size', variant.batch_size)
     # we shard the leading dimension (batch dimension) accross all devices evenly
-    sharding = jax.sharding.PositionalSharding(devices)
+    mesh = jax.sharding.Mesh(np.array(devices), ('batch',))
+    sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec('batch'))
     shard_fn = partial(shard_batch, sharding=sharding)
 
     # prevent tensorflow from using GPUs

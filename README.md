@@ -27,31 +27,64 @@ If you find this repository useful for your research, please cite:
 ```
 
 ## Installation
-1. Create a conda environment:
-```
-conda create -n dsrl_pi0 python=3.11.11
-conda activate dsrl_pi0
-```
 
-2. Clone this repo with all submodules
+> **Note on JAX / CUDA:** the original repo pins `jax==0.5.0` with the CUDA 12
+> plugin. That stack does **not** support Blackwell GPUs (RTX 5090, sm_120).
+> This fork is pinned to `jax==0.10.0` + `jax-cuda13-plugin==0.10.0` and pulls in
+> newer `flax`, `orbax-checkpoint`, `wandb`, `jaxtyping`, `optax`, and `distrax`
+> to keep the API surface consistent. It is backward-compatible on Hopper /
+> Ada GPUs as well — the CUDA 13 plugin is runtime-compatible with any recent
+> NVIDIA driver.
+
+1. Create a Python 3.11 virtual environment. We use [uv](https://docs.astral.sh/uv/):
 ```
-git clone git@github.com:nakamotoo/dsrl_pi0.git --recurse-submodules
+uv venv --python 3.11
+source .venv/bin/activate
+```
+(A `conda create -n dsrl_pi0 python=3.11.11` env works too — just replace
+every `uv pip install` below with `pip install`.)
+
+2. Clone this repo with all submodules:
+```
+git clone git@github.com:RL-VLA/dsrl_pi0.git --recurse-submodules
 cd dsrl_pi0
 ```
 
-3. Install all packages and dependencies
+3. Install all packages and dependencies:
 ```
-pip install -e .
-pip install -r requirements.txt
-pip install "jax[cuda12]==0.5.0"
+uv pip install -e .
+uv pip install -r requirements.txt
+
+# JAX 0.10 with the CUDA 13 plugin (Blackwell-capable)
+uv pip install --upgrade "jax==0.10.0" "jaxlib==0.10.0" "jax-cuda13-plugin==0.10.0"
+
+# Pulled in by the jax bump — versions verified to work together
+uv pip install --upgrade "flax==0.12.6" "orbax-checkpoint==0.11.36" \
+  "wandb==0.26.0" "jaxtyping==0.3.9" "optax==0.2.8" "distrax==0.1.8"
 
 # install openpi
-pip install -e openpi
-pip install -e openpi/packages/openpi-client
+uv pip install -e openpi
+uv pip install -e openpi/packages/openpi-client
 
 # install Libero
-pip install -e LIBERO
-pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu # needed for libero
+uv pip install -e LIBERO
+uv pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu # needed for libero
+
+# First-time libero setup: regenerate ~/.libero/config.yaml with local paths
+uv run python -c "from libero.libero import set_libero_default_path; set_libero_default_path()"
+```
+
+4. **If you have multiple CUDA plugins installed** (e.g. you previously ran the
+   original `jax[cuda12]==0.5.0` install), remove the cu12 artifacts to avoid
+   `PJRT_Api already exists for device type cuda`:
+```
+uv pip uninstall -y jax-cuda12-pjrt jax-cuda12-plugin
+```
+
+5. Sanity check:
+```
+uv run python -c "import jax; print(jax.devices())"
+# → [CudaDevice(id=0), ...]
 ```
 
 ## Training (Simulation)
@@ -63,6 +96,15 @@ Aloha
 ```
 bash examples/scripts/run_aloha.sh
 ```
+
+Before running, edit the `WANDB_ENTITY` line in the script (top of
+`examples/scripts/run_*.sh`) to your own entity.
+
+See [`docs/training_loop.md`](docs/training_loop.md) for a walkthrough of the
+training loop (pi0 × SAC interaction, replay buffer, reward relabeling) and
+[`docs/config_params.md`](docs/config_params.md) for the full list of CLI
+flags and their Libero defaults.
+
 ### Training Logs
 We provide sample W&B runs and logs: https://wandb.ai/mitsuhiko/DSRL_pi0_public
 
