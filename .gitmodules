@@ -4,5 +4,5 @@
 	branch = run_fix_yipu
 [submodule "openpi"]
 	path = openpi
-	url = git@github.com:RL-VLA/openpi.git
-	branch = run_fix_yipu
+	url = git@github.com:arayabrain/openpi_pub.git
+	branch = main

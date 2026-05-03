@@ -63,6 +63,12 @@ ROBOMETER_QUEUE_MAX_DEPTH=${ROBOMETER_QUEUE_MAX_DEPTH:-4}
 
 uv pip install mujoco==3.3.1
 
+# SAC action shape is (query_freq, 32) — one 32-d noise latent PER env-step
+# in the chunk (was (1, 32) broadcast before the lift). Actor head outputs
+# query_freq * 32 = 640 values; bumping --query_freq grows the actor head
+# proportionally. Paper-recommended config is much wider — see
+# docs/sac_action_lift_plan.md (e.g. --hidden_dims 2048 2048 2048 and
+# --action_magnitude 1.5).
 uv run examples/launch_train_sim_robometer.py \
 --algorithm pixel_sac \
 --env libero \

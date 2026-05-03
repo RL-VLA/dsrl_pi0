@@ -21,6 +21,8 @@ from libero.libero import get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
 
 from jaxrl2.data import ReplayBuffer
+from jaxrl2.data.dsrl_na_replay_buffer import DSRLNAReplayBuffer
+from jaxrl2.agents.pixel_dsrl_na import PixelDSRLNALearner
 from jaxrl2.utils.wandb_logger import WandBLogger, create_exp_name
 import tempfile
 from functools import partial
@@ -71,7 +73,43 @@ class DummyEnv(gym.ObservationWrapper):
                 state_dim = 14
             obs_dict['state'] = Box(low=-1.0, high=1.0, shape=(state_dim, 1), dtype=np.float32)
         self.observation_space = Dict(obs_dict)
-        self.action_space = Box(low=-1, high=1, shape=(1, 32,), dtype=np.float32) # 32 is the noise action space of pi 0
+        # SAC noise action shape: (sac_action_chunk_size, 32). Decoupled from
+        # query_freq so we can choose between the reference behaviour
+        # (sac_action_chunk_size=1, single latent broadcast across pi0's
+        # 50-step noise tensor) and the lifted form (sac_action_chunk_size>1,
+        # one latent per pi0 noise row, trailing rows filled by repeating the
+        # last SAC row downstream in collect_traj). See
+        # docs/sac_action_lift_plan.md.
+        if not (isinstance(variant.query_freq, int) and variant.query_freq > 0):
+            raise ValueError(
+                f"variant.query_freq must be a positive int (got {variant.query_freq!r}); "
+                "set --query_freq on the launcher."
+            )
+        sac_chunk = int(getattr(variant, 'sac_action_chunk_size', 1))
+        if sac_chunk < 1 or sac_chunk > 50:
+            raise ValueError(
+                f"sac_action_chunk_size must be in [1, 50] (pi0 action_chunk_size); "
+                f"got {sac_chunk}."
+            )
+        self.action_space = Box(
+            low=-1, high=1,
+            shape=(sac_chunk, 32),
+            dtype=np.float32,
+        )
+        # Diffused env-action space — used by DSRL-NA's action critic. The
+        # last-axis dim is the env's actuator count (libero=7, aloha=14). The
+        # SAC actor never sees this space; only the diffused-action critic does.
+        if variant.env == 'libero':
+            env_action_dim = 7
+        elif variant.env == 'aloha_cube':
+            env_action_dim = 14
+        else:
+            raise NotImplementedError(f"diffused action_dim unknown for env={variant.env!r}")
+        self.diffused_action_space = Box(
+            low=-1, high=1,
+            shape=(variant.query_freq, env_action_dim),
+            dtype=np.float32,
+        )
 
 
 def main(variant):
@@ -152,11 +190,47 @@ def main(variant):
     else:
         raise NotImplementedError()
     agent_dp = policy_config.create_trained_policy(config, checkpoint_dir)
+    flow_steps = int(getattr(variant, 'flow_integration_steps', -1))
+    if flow_steps > 0 and hasattr(agent_dp, '_sample_kwargs'):
+        agent_dp._sample_kwargs['num_steps'] = flow_steps
+        print(f"pi0 flow_integration_steps overridden to {flow_steps}")
     print("Loaded pi0 policy from %s", checkpoint_dir)
-    agent = PixelSACLearner(variant.seed, sample_obs, sample_action, **kwargs)
 
-    online_buffer_size = variant.max_steps  // variant.multi_grad_step
-    online_replay_buffer = ReplayBuffer(dummy_env.observation_space, dummy_env.action_space, int(online_buffer_size))
+    algorithm = getattr(variant, "algorithm", "pixel_sac")
+    cli_buf = int(getattr(variant, 'online_buffer_size', -1))
+    if cli_buf > 0:
+        online_buffer_size = cli_buf
+    else:
+        online_buffer_size = variant.max_steps // variant.multi_grad_step
+    if algorithm == "pixel_sac":
+        agent = PixelSACLearner(variant.seed, sample_obs, sample_action, **kwargs)
+        online_replay_buffer = ReplayBuffer(
+            dummy_env.observation_space, dummy_env.action_space, int(online_buffer_size)
+        )
+    elif algorithm == "pixel_dsrl_na":
+        sample_diffused_action = add_batch_dim(dummy_env.diffused_action_space.sample())
+        print('sample diffused action shape', sample_diffused_action.shape)
+        bup_ent = bool(int(getattr(variant, "dsrl_na_backup_entropy", 0)))
+        noise_scale_inside = bool(int(getattr(variant, "noise_scale_inside", 0)))
+        agent = PixelDSRLNALearner(
+            variant.seed,
+            observations=sample_obs,
+            actions=sample_action,                 # noise actions, shape (1, sac_action_chunk_size, 32)
+            env_actions=sample_diffused_action,    # diffused env-actions, shape (1, query_freq, 7)
+            backup_entropy=bup_ent,
+            noise_scale_inside=noise_scale_inside,
+            **kwargs,
+        )
+        # Buffer's executed_action_dim is the FLAT env-action dim (e.g. 20*7=140 for libero).
+        executed_action_dim = int(np.prod(dummy_env.diffused_action_space.shape))
+        online_replay_buffer = DSRLNAReplayBuffer(
+            dummy_env.observation_space,
+            dummy_env.action_space,
+            executed_action_dim=executed_action_dim,
+            capacity=int(online_buffer_size),
+        )
+    else:
+        raise ValueError(f"unknown variant.algorithm={algorithm!r}")
     replay_buffer = online_replay_buffer
     replay_buffer.seed(variant.seed)
     trajwise_alternating_training_loop(variant, agent, env, eval_env, online_replay_buffer, replay_buffer, wandb_logger, shard_fn=shard_fn, agent_dp=agent_dp)

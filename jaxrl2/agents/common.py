@@ -98,6 +98,44 @@ def sample_actions_jit(
     return rng, dist.sample(seed=key)
 
 
+@partial(jax.jit, static_argnames="actor_apply_fn")
+def sample_actions_seeded_jit(
+    seed,
+    actor_apply_fn: Callable[..., distrax.Distribution],
+    actor_params: Params,
+    observations: np.ndarray,
+    actor_batch_stats: Any,
+) -> jnp.ndarray:
+    """Sample without splitting an external rng — caller owns the seed."""
+    input_collections = {'params': actor_params}
+    if actor_batch_stats is not None:
+        input_collections['batch_stats'] = actor_batch_stats
+    dist = actor_apply_fn(input_collections, observations)
+    return dist.sample(seed=seed)
+
+
+@partial(jax.jit, static_argnames='actor_apply_fn')
+def sample_actions_with_log_probs_jit(
+        rng: PRNGKey, actor_apply_fn: Callable[..., distrax.Distribution],
+        actor_params: Params,
+        observations: np.ndarray,
+        actor_batch_stats: Any) -> Tuple[PRNGKey, jnp.ndarray, jnp.ndarray]:
+    """Sample actions AND compute their log-probs in one pass.
+
+    Uses ``dist.sample_and_log_prob`` so log_probs of transformed distributions
+    (e.g., TanhMultivariateNormalDiag) are computed via the change-of-variables
+    correction rather than re-evaluating ``dist.log_prob(actions)`` (which is
+    numerically unstable for tanh-bounded samples near ±1).
+    """
+    input_collections = {'params': actor_params}
+    if actor_batch_stats is not None:
+        input_collections['batch_stats'] = actor_batch_stats
+    dist = actor_apply_fn(input_collections, observations)
+    rng, key = jax.random.split(rng)
+    actions, log_probs = dist.sample_and_log_prob(seed=key)
+    return rng, actions, log_probs
+
+
 class ModuleDict(nn.Module):
     """
     from https://github.com/rail-berkeley/jaxrl_minimal/blob/main/jaxrl_m/common/common.py#L33
