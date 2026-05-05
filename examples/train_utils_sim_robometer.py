@@ -560,6 +560,20 @@ def trajwise_alternating_training_loop(variant, agent, env, eval_env, online_rep
 
         algorithm = getattr(variant, 'algorithm', 'pixel_sac')
         is_na = algorithm == 'pixel_dsrl_na'
+        scattered_mode = str(getattr(variant, 'scattered_mode', 'off'))
+        is_scattered = scattered_mode != 'off'
+        if is_scattered:
+            if is_na:
+                raise ValueError(
+                    "scattered_mode != 'off' is not supported with pixel_dsrl_na yet "
+                    "(see docs/scattered_training_samples_plan.md, Phase 3)."
+                )
+            if int(variant.sac_action_chunk_size) != int(variant.query_freq):
+                raise ValueError(
+                    f"scattered_mode={scattered_mode!r} requires lifted action chunks "
+                    f"(sac_action_chunk_size == query_freq); got "
+                    f"sac_action_chunk_size={variant.sac_action_chunk_size}, query_freq={variant.query_freq}."
+                )
 
         def _insert_batched(resolved_pairs):
             """Apply reward_fn to a batch of resolved (traj, score) pairs and insert."""
@@ -585,26 +599,35 @@ def trajwise_alternating_training_loop(variant, agent, env, eval_env, online_rep
                 # Flush rollout-phase events into the trace JSONL so the
                 # chrome viewer shows the rollout band between SAC outer steps.
                 _na_flush_rollout(variant)
-                # 2) Fire-and-forget scoring for this episode.
-                pending.submit_episode(
-                    traj,
-                    task=str(variant.task_description),
-                    sample_id=f"ep_{episode_count}",
-                )
-                episode_count += 1
+                if is_scattered:
+                    # Scattered mode short-circuits the chunk-grid HTTP pipeline:
+                    # the mock scorer is in-process, and one episode's samples
+                    # are emitted synchronously into the buffer.
+                    total_env_steps += _score_and_insert_scattered(
+                        variant, traj, online_replay_buffer, wandb_logger, i
+                    )
+                    episode_count += 1
+                else:
+                    # 2) Fire-and-forget scoring for this episode.
+                    pending.submit_episode(
+                        traj,
+                        task=str(variant.task_description),
+                        sample_id=f"ep_{episode_count}",
+                    )
+                    episode_count += 1
 
-                # 3) If the queue grew past the configured max depth, block on the
-                #    oldest one before the next rollout — otherwise memory piles up.
-                over_depth_batch = []
-                while len(pending) > variant.robometer_queue_max_depth:
-                    popped = pending.popleft_oldest()
-                    if popped is not None:
-                        over_depth_batch.append(popped)
-                _insert_batched(over_depth_batch)
+                    # 3) If the queue grew past the configured max depth, block on the
+                    #    oldest one before the next rollout — otherwise memory piles up.
+                    over_depth_batch = []
+                    while len(pending) > variant.robometer_queue_max_depth:
+                        popped = pending.popleft_oldest()
+                        if popped is not None:
+                            over_depth_batch.append(popped)
+                    _insert_batched(over_depth_batch)
 
-                # 4) Drain any futures that already resolved while physics ran, and
-                #    score the whole set in ONE reward_fn call (batched).
-                _insert_batched(pending.drain_ready())
+                    # 4) Drain any futures that already resolved while physics ran, and
+                    #    score the whole set in ONE reward_fn call (batched).
+                    _insert_batched(pending.drain_ready())
 
                 # 5) If the buffer is still not warm enough to train, block on the
                 #    remaining queue — we can't proceed without data anyway.
@@ -1057,6 +1080,153 @@ def _na_update_step(agent, agent_dp, variant, batch, online_replay_buffer, step_
     return info
 
 
+def _score_and_insert_scattered(variant, traj, online_replay_buffer, wandb_logger, step):
+    """Score one episode with the scattered-frame robometer and insert.
+
+    Synchronous (no async queue) because the mock is in-process; when the real
+    scattered-robometer endpoint exists we'll move this to a Future-backed
+    pipeline mirroring ``PendingScores``.
+
+    Returns the number of env steps consumed (for total_env_steps accounting).
+    """
+    from examples.scattered_robometer import MockScatteredScorer
+    from jaxrl2.data import scattered_samples as ss
+
+    H = int(variant.query_freq)
+    mode = str(variant.scattered_mode)
+    T = int(traj['env_steps'])
+
+    obs_stream = traj['scattered_obs_stream']
+    noise_stream = traj['scattered_noise_stream']
+    executed_stream = traj['scattered_executed_stream']
+    libero_rewards = np.asarray(traj['libero_rewards_per_step'], dtype=np.float32)[:T]
+    libero_success_step = traj['libero_success_step']
+
+    if not bool(int(getattr(variant, 'scattered_use_mock', 1))):
+        raise NotImplementedError(
+            "scattered_use_mock=0 selected, but no real scattered-frame robometer "
+            "endpoint is wired up yet."
+        )
+
+    scorer = MockScatteredScorer(
+        num_selected=int(variant.scattered_num_selected),
+        strategy=str(variant.scattered_strategy),
+        progress_oracle=str(variant.scattered_progress_oracle),
+        emit_success=bool(int(variant.scattered_emit_success)),
+        seed=int(variant.scattered_seed),
+    )
+    # The mock doesn't read pixel content; pass a length-T stub so the API
+    # contract (4D video) is satisfied for forward-compat with the real server.
+    video_stub = np.zeros((T, 1, 1, 3), dtype=np.uint8)
+    sample_id = f"ep_{online_replay_buffer._traj_counter}"
+    score = scorer.score(
+        video=video_stub,
+        task=str(variant.task_description),
+        sample_id=sample_id,
+        libero_rewards=libero_rewards,
+        libero_success_step=libero_success_step,
+    )
+
+    progress_dense = ss.interpolate_progress(score.selected_indices, score.progress, T)
+    if score.success is not None:
+        success_dense = ss.interpolate_success(score.selected_indices, score.success, T)
+    else:
+        success_dense = np.zeros((T,), dtype=np.float32)
+
+    rng = np.random.default_rng(int(variant.scattered_seed) + online_replay_buffer._traj_counter)
+    if mode == 'look_future':
+        samples = ss.construct_look_future(
+            selected_indices=score.selected_indices,
+            obs_stream=obs_stream,
+            noise_stream=noise_stream,
+            executed_stream=executed_stream,
+            progress_dense=progress_dense,
+            success_dense=success_dense,
+            H=H,
+            env=variant.env,
+        )
+    elif mode == 'look_history':
+        samples = ss.construct_look_history(
+            selected_indices=score.selected_indices,
+            obs_stream=obs_stream,
+            noise_stream=noise_stream,
+            executed_stream=executed_stream,
+            progress_dense=progress_dense,
+            success_dense=success_dense,
+            H=H,
+            env=variant.env,
+        )
+    elif mode == 'random_subsample':
+        samples = ss.construct_random_subsample(
+            obs_stream=obs_stream,
+            noise_stream=noise_stream,
+            executed_stream=executed_stream,
+            progress_dense=progress_dense,
+            success_dense=success_dense,
+            H=H,
+            env=variant.env,
+            n=int(variant.scattered_random_n),
+            rng=rng,
+        )
+    else:
+        raise ValueError(f"unknown scattered_mode={mode!r}")
+
+    if not samples:
+        warnings.warn(f"scattered mode={mode!r} produced 0 samples for episode {sample_id}")
+        return int(traj['env_steps'])
+
+    reward_fn = get_reward_fn(variant.robometer_reward_kind)
+    rewards, masks = ss.apply_reward_fn_scattered(
+        reward_fn,
+        samples,
+        libero_is_success=bool(traj['is_success']),
+        libero_success_step=libero_success_step,
+        H=H,
+        robometer_success_threshold=float(variant.robometer_success_threshold),
+        emit_success=score.success is not None,
+        reward_kind=str(variant.robometer_reward_kind),
+    )
+
+    expected_action_shape = tuple(online_replay_buffer.action_space.shape)
+    for k, sample in enumerate(samples):
+        next_sample = samples[k + 1] if k < len(samples) - 1 else sample
+        obs = {kk: vv[0] for kk, vv in sample.obs.items()}
+        next_obs = {kk: vv[0] for kk, vv in sample.next_obs.items()}
+        if not variant.add_states:
+            obs.pop('state', None)
+            next_obs.pop('state', None)
+        if tuple(sample.noise.shape) != expected_action_shape:
+            raise ValueError(
+                f"scattered sample noise shape {sample.noise.shape} != buffer action_space {expected_action_shape}"
+            )
+        online_replay_buffer.insert(dict(
+            observations=obs,
+            next_observations=next_obs,
+            actions=sample.noise,
+            next_actions=next_sample.noise,
+            rewards=float(rewards[k]),
+            masks=float(masks[k]),
+            discount=variant.discount ** H,
+        ))
+    online_replay_buffer.increment_traj_counter()
+
+    log_payload = {
+        'episode_return (libero)': traj['episode_return'],
+        'is_success (libero)': int(traj['is_success']),
+        'scattered/num_samples': len(samples),
+        'scattered/num_padded': int(sum(1 for s in samples if s.padded)),
+        'scattered/reward_sum': float(np.sum(rewards)),
+        'scattered/mean_reward': float(np.mean(rewards)),
+    }
+    if len(score.progress):
+        log_payload['scattered/final_progress'] = float(score.progress[-1])
+        log_payload['scattered/mean_progress'] = float(score.progress.mean())
+    if score.success is not None and len(score.success):
+        log_payload['scattered/final_success'] = float(score.success[-1])
+    wandb_logger.log(log_payload, step=step)
+    return int(traj['env_steps'])
+
+
 def _insert_scored_traj(variant, traj, rewards, masks, scores, online_replay_buffer, wandb_logger, step):
     """Insert one scored episode into the replay buffer and log robometer stats."""
     add_online_data_to_buffer(variant, traj, rewards, masks, online_replay_buffer)
@@ -1128,12 +1298,12 @@ def collect_traj(variant, agent, env, i, agent_dp=None):
     env_max_reward = variant.env_max_reward
 
     agent._rng, rng = jax.random.split(agent._rng)
-    
+
     if 'libero' in variant.env:
         obs = env.reset()
     elif 'aloha' in variant.env:
         obs, _ = env.reset()
-    
+
     image_list = [] # for visualization
     rewards = []
     action_list = []                           # SAC noise latents per chunk: (T_act, D_noise=32)
@@ -1141,6 +1311,14 @@ def collect_traj(variant, agent, env, i, agent_dp=None):
     obs_list = []
     chunk_frames: List[np.ndarray] = []   # 256x256 agentview frames at chunk boundaries
     chunk_env_steps: List[int] = []
+
+    # Scattered training samples: per-env-step streams, populated only when
+    # variant.scattered_mode != 'off'. Zero overhead in the default path.
+    scattered_mode = getattr(variant, 'scattered_mode', 'off')
+    record_scattered = scattered_mode != 'off'
+    scattered_obs_stream: List[dict] = []
+    scattered_executed_stream: List[np.ndarray] = []
+    scattered_noise_chunks: List[np.ndarray] = []  # one (query_freq, noise_dim) row per chunk
 
     # DSRL-NA bookkeeping (no-op for DSRL-SAC). The pi0 prompt-encoded inputs are
     # stored verbatim per chunk so the per-update distillation can re-run pi0
@@ -1242,7 +1420,22 @@ def collect_traj(variant, agent, env, i, agent_dp=None):
                 chunk_frames.append(np.ascontiguousarray(obs["pixels"]["top"]))
             chunk_env_steps.append(t)
 
+            # For scattered sampling we need a per-env-step lifted-noise stream.
+            # Stash this chunk's (query_freq, noise_dim) latents — collect_traj
+            # only constructs the stream array at the end.
+            if record_scattered:
+                ns = np.asarray(actions_noise, dtype=np.float32)
+                if ns.ndim != 2 or ns.shape[0] != query_frequency:
+                    raise RuntimeError(
+                        f"scattered_mode requires lifted noise (sac_action_chunk_size=={query_frequency}); "
+                        f"got actions_noise shape {ns.shape}"
+                    )
+                scattered_noise_chunks.append(ns)
+
         action_t = actions[t % query_frequency]
+        if record_scattered:
+            scattered_obs_stream.append({k: np.asarray(v) for k, v in obs_dict.items()})
+            scattered_executed_stream.append(np.asarray(action_t, dtype=np.float32))
         if 'libero' in variant.env:
             obs, reward, done, _ = env.step(action_t)
         elif 'aloha' in variant.env:
@@ -1299,6 +1492,20 @@ def collect_traj(variant, agent, env, i, agent_dp=None):
         if save_kv_cache and k_cache_outs:
             out['original_k_cache'] = k_cache_outs
             out['original_v_cache'] = v_cache_outs
+    if record_scattered:
+        T = len(scattered_obs_stream)
+        if scattered_noise_chunks:
+            noise_stream = np.concatenate(scattered_noise_chunks, axis=0)[:T]
+        else:
+            noise_stream = np.zeros((T, 0), dtype=np.float32)
+        executed_stream = (
+            np.stack(scattered_executed_stream, axis=0)
+            if scattered_executed_stream
+            else np.zeros((T, 0), dtype=np.float32)
+        )
+        out['scattered_obs_stream'] = scattered_obs_stream
+        out['scattered_noise_stream'] = noise_stream
+        out['scattered_executed_stream'] = executed_stream
     return out
 
 def perform_control_eval(agent, env, i, variant, wandb_logger, agent_dp=None):

@@ -61,6 +61,17 @@ ROBOMETER_REWARD_KIND=${ROBOMETER_REWARD_KIND:-robo_success_plus_robo_progress}
 ROBOMETER_SUCCESS_THRESHOLD=${ROBOMETER_SUCCESS_THRESHOLD:-0.5}
 ROBOMETER_QUEUE_MAX_DEPTH=${ROBOMETER_QUEUE_MAX_DEPTH:-4}
 
+# Scattered training samples (mock scorer). Default off; set
+# SCATTERED_MODE=look_future|look_history|random_subsample to enable.
+# Requires sac_action_chunk_size == query_freq (lifted) and pixel_sac.
+SCATTERED_MODE=${SCATTERED_MODE:-off}
+SCATTERED_STRATEGY=${SCATTERED_STRATEGY:-libero_milestones}
+SCATTERED_PROGRESS_ORACLE=${SCATTERED_PROGRESS_ORACLE:-libero_reward_normalised}
+SCATTERED_NUM_SELECTED=${SCATTERED_NUM_SELECTED:-20}
+SCATTERED_RANDOM_N=${SCATTERED_RANDOM_N:-20}
+SCATTERED_EMIT_SUCCESS=${SCATTERED_EMIT_SUCCESS:-1}
+SCATTERED_SEED=${SCATTERED_SEED:-0}
+
 uv pip install mujoco==3.3.1
 
 # SAC action shape is (query_freq, 32) — one 32-d noise latent PER env-step
@@ -90,4 +101,11 @@ uv run examples/launch_train_sim_robometer.py \
 --robometer_url "$ROBOMETER_URL" \
 --robometer_reward_kind "$ROBOMETER_REWARD_KIND" \
 --robometer_success_threshold "$ROBOMETER_SUCCESS_THRESHOLD" \
---robometer_queue_max_depth "$ROBOMETER_QUEUE_MAX_DEPTH"
+--robometer_queue_max_depth "$ROBOMETER_QUEUE_MAX_DEPTH" \
+--scattered_mode "$SCATTERED_MODE" \
+--scattered_strategy "$SCATTERED_STRATEGY" \
+--scattered_progress_oracle "$SCATTERED_PROGRESS_ORACLE" \
+--scattered_num_selected "$SCATTERED_NUM_SELECTED" \
+--scattered_random_n "$SCATTERED_RANDOM_N" \
+--scattered_emit_success "$SCATTERED_EMIT_SUCCESS" \
+--scattered_seed "$SCATTERED_SEED"

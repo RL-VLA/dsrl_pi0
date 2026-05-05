@@ -102,6 +102,31 @@ if __name__ == '__main__':
     parser.add_argument('--robometer_max_retries', default=3, type=int,
                         help='HTTP retries inside the RobometerClient for transient errors.')
 
+    # ---- Scattered training samples (mock scorer until real endpoint exists) ----
+    parser.add_argument('--scattered_mode', default='off',
+                        choices=['off', 'look_future', 'look_history', 'random_subsample'],
+                        help='Off = use the existing per-chunk-grid pipeline. Otherwise '
+                             'reconstruct training samples aligned to scattered-frame '
+                             'progress annotations. See docs/scattered_training_samples_plan.md.')
+    parser.add_argument('--scattered_strategy', default='libero_milestones',
+                        choices=['uniform_random', 'uniform_grid', 'libero_milestones'],
+                        help='Mock scorer: how to pick the K annotated frames.')
+    parser.add_argument('--scattered_progress_oracle', default='libero_reward_normalised',
+                        choices=['libero_reward_normalised', 'monotone_random'],
+                        help='Mock scorer: how to assign progress at the selected frames.')
+    parser.add_argument('--scattered_num_selected', default=20, type=int,
+                        help='Mock scorer: number of annotated frames per episode.')
+    parser.add_argument('--scattered_random_n', default=20, type=int,
+                        help='[scattered_mode=random_subsample] number of random sample '
+                             'starts to draw per episode.')
+    parser.add_argument('--scattered_emit_success', default=1, type=int,
+                        help='Mock scorer: 1 emits a success head, 0 returns None.')
+    parser.add_argument('--scattered_seed', default=0, type=int,
+                        help='Mock scorer seed (combined with episode id for per-episode RNG).')
+    parser.add_argument('--scattered_use_mock', default=1, type=int,
+                        help='1 = use MockScatteredScorer (current default; only option '
+                             'until the real endpoint is wired up).')
+
     # ---- Reference-impl alignment knobs ------------------------------------
     parser.add_argument('--target_entropy', default='auto',
                         help="SAC target entropy. 'auto' = -action_dim (our "
